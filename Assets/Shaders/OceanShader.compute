@@ -1,0 +1,127 @@
+#pragma kernel CSMain
+
+RWTexture2D<float4> renderTexture;
+float screenWidth;
+float screenHeight;
+float time;
+float3 sunDirection;
+float waveSpeed;
+float choppiness;
+
+float iterationCountForRaymarching;
+float iterationCountForNormalCalculations;
+
+float3 SunReflections(float3 rayDirection)
+{
+    return pow(max(0.0, dot(rayDirection, sunDirection)), 1200.0)*100.0;
+}
+
+float DistanceToPlane(float3 origin, float3 direction, float3 point_, float3 normal)
+{
+    return clamp(dot(point_-origin, normal)/dot(direction, normal), -1.0, 1000);
+}
+
+float2 Wavedx(float2 position, float2 direction, float frequency, float timeShift)
+{
+    float x = dot(direction, position)*frequency+timeShift;
+    float wave=exp(sin(x)-1.0);
+    float dx=wave*cos(x);
+    return float2(wave, -dx);
+}
+
+//Fractional brownian motion calculations
+// https://www.shadertoy.com/view/MdXyzX
+float WaveHeight(float2 position, int iterations)
+{
+    float wavePhaseShift = length(position) * 0.1;
+    float iter = 0.0;
+    float frequency = 0.85;
+    float timeMultiplier = 2.0; 
+    float weight = 1.0;
+    float sumOfValues = 0.0;
+    float sumOfWeights = 0.0;
+
+    for(int i=0; i<iterations; i++)
+    {
+        float2 p=float2(sin(iter), cos(iter));
+        float2 res=Wavedx(position, p, frequency, time*timeMultiplier+wavePhaseShift);
+        position+=p*res.y*weight*0.3;
+        sumOfValues+=res.x*weight;
+        sumOfWeights+=weight;
+
+        weight=lerp(weight, 0.0, 0.2);
+        frequency*=1.18;
+        timeMultiplier*=1.07;
+
+        iter+=1232.39123;
+    }
+
+    return  sumOfValues/sumOfWeights;
+}
+
+float RayMarching(float3 camera, float3 start, float3 end, float depth)
+{
+    float3 pos=start;
+    float3 direction=normalize(end-start);
+
+    for(int i=0; i<64; i++)
+    {
+        float height=WaveHeight(pos.xz, iterationCountForRaymarching)*depth-depth;
+        if(height+0.01>pos.y)
+        {
+            return  distance(pos,camera);
+        }
+
+        pos+=direction*(pos.y-height);
+    }
+
+    return  distance(start, camera);
+}
+
+float3 CalculateNormal(float2 pos, float e, float depth)
+{
+    float2 ex=float2(e,0);
+    float H=WaveHeight(pos.xy, iterationCountForNormalCalculations)*depth;
+    float3 a=float3(pos.x, H, pos.y);
+    return  normalize(
+        cross(
+        a-float3(pos.x-e, WaveHeight(pos.xy-ex.xy, iterationCountForNormalCalculations)*depth, pos.y),
+        a-float3(pos.x, WaveHeight(pos.xy+ex.yx, iterationCountForNormalCalculations)*depth, pos.y+e)
+        ));
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    float2 uv=(id.xy/float2(screenWidth, screenHeight)*2.0-1.0)*float2(screenWidth/screenHeight, 1.0);
+    float3 ray=normalize(float3(uv,1));
+    
+    if (ray.y>=0.0)
+        return;
+
+    float3 topPlanePos=0.0;
+    float3 bottomPlanePos=-float3(0.0,choppiness, 0.0);
+
+    float3 rayOrigin=float3(0.0,1.0,time*waveSpeed);
+
+    float distanceToTopPlane=DistanceToPlane(rayOrigin, ray, topPlanePos, float3(0,1,0));
+    float distanceToBottomPlane=DistanceToPlane(rayOrigin, ray, bottomPlanePos, float3(0,1,0));
+    float3 topPlaneHitPosition=rayOrigin+ray*distanceToTopPlane;
+    float3 bottomPlaneHitPosition=rayOrigin+ray*distanceToBottomPlane;
+
+    float dist=RayMarching(rayOrigin, topPlaneHitPosition, bottomPlaneHitPosition, choppiness);
+    float3 waterHitPos=rayOrigin+ray*dist;
+
+    float3 N=CalculateNormal(waterHitPos.xz, 0.01, choppiness);
+
+    N = lerp(N, float3(0.0, 1.0, 0.0), 0.8 * min(1.0, sqrt(dist*0.01) * 1.1));
+    float fresnel = 0.04 + (1.0-0.04)*pow(1.0 - max(0.0, dot(-N, ray)), 5.0);
+
+    float3 R = normalize(reflect(ray, N));
+    
+    float3 reflection = float3(115.0/255.0, 171.0/255.0, 225.0/255.0)+SunReflections(R);
+    float3 scattering = float3(0.0293, 0.0698, 0.1717) * 0.1 * (0.2 + (waterHitPos.y + choppiness) / choppiness);
+    float3 pixelColor = fresnel * reflection + scattering;
+    
+    renderTexture[id.xy]=float4(pixelColor, 1);
+}
